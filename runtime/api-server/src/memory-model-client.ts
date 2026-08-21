@@ -27,6 +27,13 @@ export interface MemoryModelVisionJsonQuery extends MemoryModelJsonQuery {
 
 export interface MemoryModelEmbeddingQuery {
   input: string;
+  /**
+   * Whether this vector is a transient search key or gets persisted. Required —
+   * the two want opposite handling when the input exceeds the model's cap, and
+   * the default that "felt safe" (clip everything) silently corrupts the index.
+   * See MemoryEmbeddingPurpose.
+   */
+  purpose: MemoryEmbeddingPurpose;
   timeoutMs?: number;
   agentRole?: string | null;
 }
@@ -483,6 +490,91 @@ export async function queryMemoryModelVisionJson(
   }
 }
 
+/**
+ * Embedding inputs are hard-capped by the model — text-embedding-3-small rejects
+ * the WHOLE request over 8192 tokens ("Invalid 'input': maximum context length is
+ * 8192 tokens") rather than truncating.
+ *
+ * The two callers of this function want OPPOSITE things when that happens, and it
+ * cannot tell them apart on its own — which is why `purpose` is required:
+ *
+ *  - "query"    a transient search vector. Narrowing it costs a little recall
+ *               precision and nothing else, so clip and carry on. Failing here
+ *               means recall silently returns nothing and the agent answers
+ *               without its own memory.
+ *  - "document" a vector that gets PERSISTED, keyed by a content fingerprint that
+ *               suppresses recomputation. A truncated one is stored as if it were
+ *               the real thing and never revisited, so it must NOT be silently
+ *               clipped — better to fail loudly and leave the entry unindexed.
+ *
+ * Getting this backwards is not hypothetical: clipping at this choke point turned
+ * "an inline image is not indexed" into "an inline image is indexed as 6000 chars
+ * of base64, indistinguishable from every other image, permanently".
+ */
+export type MemoryEmbeddingPurpose = "query" | "document";
+
+/**
+ * Token budget, with headroom under the model's 8192.
+ *
+ * The per-character costs below are measured CEILINGS from cl100k_base (the
+ * encoding text-embedding-3-small uses), not averages — the whole point is that
+ * the estimate must be an UPPER bound, or the clip does not actually guarantee
+ * anything.
+ *
+ * An earlier version used 0.25 tokens per ASCII char ("~4 chars per token"),
+ * which is true of English prose and hand-written code and false of everything
+ * denser. Measured against a real tokenizer, that let 13 of 22 realistic input
+ * classes through over the cap: base64 reached 20,109 tokens (2.45x), minified
+ * JS 11,756, a lockfile-shaped JSON 10,933, stack traces 12,173. The failing
+ * inputs in production were pasted files, so the bug survived the "fix" for
+ * anything that wasn't prose.
+ *
+ * ASCII: scanning all 128 code points, the worst single character costs exactly
+ * 1 token (rare punctuation; dense text like base64/hex/minified JS approaches
+ * it). NON-ASCII: the BMP maxes at 3 (<=3 UTF-8 bytes), but astral planes reach
+ * 4 (4 bytes -> 4 byte-fallback tokens) — Deseret, Cuneiform, Tangut, CJK ext-G,
+ * plane-15/16 PUA, variation selectors.
+ *
+ * A consequence worth stating: since every character now costs at least one
+ * token, the clipped string can never be longer than the budget in CHARACTERS
+ * either. The tests assert that, which is a check independent of this estimator.
+ */
+export const MAX_EMBEDDING_QUERY_TOKENS = 7000;
+const TOKENS_PER_ASCII_CHAR = 1;
+const TOKENS_PER_NON_ASCII_CHAR = 4;
+
+/** Upper-bound token estimate. Deliberately pessimistic — over-clipping a query
+ *  is cheap, a rejected request is not. */
+export function estimateEmbeddingTokens(text: string): number {
+  let tokens = 0;
+  for (const char of text) {
+    tokens +=
+      char.codePointAt(0)! < 128
+        ? TOKENS_PER_ASCII_CHAR
+        : TOKENS_PER_NON_ASCII_CHAR;
+  }
+  return Math.ceil(tokens);
+}
+
+/** Clip to the token budget, cutting on a code-point boundary so the result can
+ *  never end in a lone surrogate. */
+export function clipToEmbeddingBudget(text: string): string {
+  if (estimateEmbeddingTokens(text) <= MAX_EMBEDDING_QUERY_TOKENS) {
+    return text;
+  }
+  let tokens = 0;
+  let out = "";
+  for (const char of text) {
+    tokens +=
+      char.codePointAt(0)! < 128
+        ? TOKENS_PER_ASCII_CHAR
+        : TOKENS_PER_NON_ASCII_CHAR;
+    if (tokens > MAX_EMBEDDING_QUERY_TOKENS) break;
+    out += char;
+  }
+  return out;
+}
+
 export async function queryMemoryModelEmbedding(
   config: MemoryModelClientConfig,
   query: MemoryModelEmbeddingQuery,
@@ -502,10 +594,14 @@ export async function queryMemoryModelEmbedding(
   if (!baseUrl || !modelId || apiStyle !== "openai_compatible") {
     return null;
   }
-  const normalizedInput = query.input.trim();
-  if (!normalizedInput) {
+  const trimmedInput = query.input.trim();
+  if (!trimmedInput) {
     return null;
   }
+  // Only a query may be narrowed; a document must reach the model whole or not
+  // at all (see MemoryEmbeddingPurpose).
+  const normalizedInput =
+    query.purpose === "query" ? clipToEmbeddingBudget(trimmedInput) : trimmedInput;
   const headers: Record<string, string> = withAgentRoleHeader(
     {
       "Content-Type": "application/json",
@@ -534,6 +630,14 @@ export async function queryMemoryModelEmbedding(
     });
     const responseText = await response.text().catch(() => "");
     if (!response.ok) {
+      // Previously this returned null with no trace anywhere in the file, so a
+      // rejected embedding was indistinguishable from "no matches": recall came
+      // back empty, the agent answered without its memory, and nothing said so.
+      // An oversized DOCUMENT still lands here by design (it is not clipped), so
+      // this is the only signal that an entry went unindexed.
+      console.warn(
+        `[memory-embedding] ${response.status} for a ${query.purpose} of ~${estimateEmbeddingTokens(normalizedInput)} est. tokens (${normalizedInput.length} chars): ${responseText.slice(0, 200)}`,
+      );
       return null;
     }
     const payload = parseJsonValueCandidate(responseText);
